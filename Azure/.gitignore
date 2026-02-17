@@ -1,0 +1,172 @@
+# ==============================================================================
+# TERRAFORM STATE FILES
+# ==============================================================================
+# Local .terraform directories
+**/.terraform/*
+
+# .tfstate files - contain sensitive information about your infrastructure
+*.tfstate
+*.tfstate.*
+
+# Crash log files
+crash.log
+crash.*.log
+
+# ==============================================================================
+# TERRAFORM VARIABLE FILES
+# ==============================================================================
+# Exclude override files as they are usually used to override resources locally
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Exclude files that may contain sensitive data
+*.tfvars
+*.tfvars.json
+
+# Exception: You may want to include example variable files
+!example.tfvars
+!terraform.tfvars.example
+
+# ==============================================================================
+# TERRAFORM CLI CONFIGURATION FILES
+# ==============================================================================
+.terraformrc
+terraform.rc
+
+# ==============================================================================
+# TERRAFORM LOCK FILES (OPTIONAL)
+# ==============================================================================
+# Include if you want to lock provider versions (recommended for teams)
+# Uncomment the line below if you want to ignore the lock file
+# .terraform.lock.hcl
+
+# ==============================================================================
+# BACKUP FILES
+# ==============================================================================
+*.backup
+*.bak
+*~
+
+# ==============================================================================
+# TERRAFORM PLAN OUTPUT
+# ==============================================================================
+*.tfplan
+*.tfplan.*
+plan.out
+plan.json
+
+# ==============================================================================
+# LAMBDA DEPLOYMENT PACKAGES (from our Image Builder code)
+# ==============================================================================
+*.zip
+lambda_*.zip
+
+# ==============================================================================
+# ENVIRONMENT FILES
+# ==============================================================================
+.env
+.env.*
+!.env.example
+
+# ==============================================================================
+# IDE AND EDITOR FILES
+# ==============================================================================
+# VSCode
+.vscode/
+*.code-workspace
+
+# IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+
+# ==============================================================================
+# OS FILES
+# ==============================================================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+
+# Linux
+*~
+.directory
+.Trash-*
+
+# ==============================================================================
+# LOG FILES
+# ==============================================================================
+*.log
+
+# ==============================================================================
+# TEMPORARY FILES
+# ==============================================================================
+*.tmp
+*.temp
+tmp/
+temp/
+
+# ==============================================================================
+# SECURITY AND SECRETS
+# ==============================================================================
+# SSH keys
+*.pem
+*.key
+*.pub
+
+# AWS credentials
+.aws/
+credentials
+
+# Secret files
+secrets/
+*.secret
+*.secrets
+
+# Certificate files
+*.crt
+*.cer
+*.p12
+*.pfx
+
+# ==============================================================================
+# TERRAFORM MODULE CACHE
+# ==============================================================================
+.terraform.tfstate.lock.info
+
+# ==============================================================================
+# TERRAFORM DOCUMENTATION
+# ==============================================================================
+# If using terraform-docs
+.terraform-docs.yml
+
+# ==============================================================================
+# ADDITIONAL PROJECT-SPECIFIC IGNORES
+# ==============================================================================
+# Add any project-specific files or directories here

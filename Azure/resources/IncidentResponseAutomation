@@ -1,0 +1,255 @@
+##
+param (
+    [Parameter(Mandatory=$false)]
+    [object] $WebhookData
+)
+
+# Step 1: Validate Webhook Input
+if (-not $WebhookData) {
+    Write-Output "Runbook executed without webhook data. Exiting..."
+    return
+}
+
+Write-Output "Runbook triggered by webhook. Parsing input..."
+
+# Extract the RequestBody from WebhookData
+$RequestBodyJson = $WebhookData.RequestBody
+$requestBodyObject = $RequestBodyJson | ConvertFrom-Json
+
+# Extract VM details from the webhook payload
+$EventData = $requestBodyObject[0]
+$subject = $EventData.subject
+
+if (-not $subject) {
+    Write-Output "No subject/resource found in webhook payload. Exiting..."
+    return
+}
+
+# Parse the resource URI from `subject` to form the subscription ID, resource group name, and VM name
+Write-Output "Parsing resource details from subject: $subject..."
+$subjectComponents = $subject -split '/'
+$sourceSubscriptionId = $subjectComponents[2]         # Subscription ID
+$sourceResourceGroup = $subjectComponents[4]          # Resource Group Name
+$vmName = $subjectComponents[-1]                      # VM Name
+Write-Output "Extracted Details - Subscription: $sourceSubscriptionId, Resource Group: $sourceResourceGroup, VM Name: $vmName"
+
+# Step 2: Authenticate with Azure using Managed Identity
+Write-Output "Authenticating with Azure using Managed Identity..."
+Connect-AzAccount -Identity
+Write-Output "Authentication successful."
+Set-AzContext -SubscriptionId $sourceSubscriptionId
+
+# Step 3: Verify if the VM Contains the Required Tag `SecurityIncidentStatus: Analyze`
+Write-Output "Retrieving VM '$vmName' details to check tags..."
+$vm = Get-AzVM -ResourceGroupName $sourceResourceGroup -Name $vmName -ErrorAction Stop
+Write-Output "Tags retreived for '$vmName'"
+
+# Check if the VM has tags and if `SecurityIncidentStatus` is set to `Analyze`
+if ($vm.Tags["SecurityIncidentStatus"] -ne "Analyze") {
+    Write-Output "VM does not have the required tag pair SecurityIncidentStatus: Analyze. Exiting runbook."
+    return
+}
+
+Write-Output "VM has the required tag pair SecurityIncidentStatus: Analyze. Proceeding with further actions..."
+
+# Step 4: Retrieve Attached Disks and Create Snapshots
+Write-Output "Retrieving attached disks for virtual machine '$vmName'..."
+$disks = $vm.StorageProfile.DataDisks + $vm.StorageProfile.OSDisk  # Retrieve both OS and data disks
+
+if ($disks.Count -eq 0) {
+    Write-Output "No disks attached to the virtual machine. Exiting runbook."
+    return
+}
+
+Write-Output "Disks found: $($disks | ForEach-Object { $_.Name })"
+
+# Create snapshots for all attached disks
+$snapshots = @()
+foreach ($disk in $disks) {
+    $diskId = $disk.ManagedDisk.Id  # Use ManagedDisk.Id (source URI for the snapshot)
+    $diskName = $disk.Name
+
+    # Generate a unique snapshot name
+    $snapshotName = "$diskName-Snapshot-$(Get-Date -Format 'yyyyMMddHHmmss')"
+    Write-Output "Creating snapshot for disk '$diskName' with snapshot name '$snapshotName'..."
+
+    # Create snapshot using SourceUri, CreateOption=Copy
+    $snapshotConfig = New-AzSnapshotConfig -SourceUri $diskId `
+                                           -Location $vm.Location `
+                                           -CreateOption Copy `
+                                           -SkuName Standard_LRS
+
+    $snapshot = New-AzSnapshot -SnapshotName $snapshotName `
+                               -ResourceGroupName $sourceResourceGroup `
+                               -Snapshot $snapshotConfig
+
+    Write-Output "Snapshot '$snapshotName' created successfully."
+    
+    # Add snapshot details to the list for later use
+    $snapshots += @{
+        SnapshotName = $snapshotName
+        DiskName = $diskName
+        IsOSDisk = ($diskName -eq $vm.StorageProfile.OSDisk.Name)        # Flag if it's OS Disk
+    }
+}
+
+Write-Output "Snapshot generation completed. Total snapshots created: $($snapshots.Count)"
+$snapshots | ForEach-Object { 
+    if ($_.IsOSDisk) {
+        Write-Output "Snapshot: $($_.SnapshotName) for Disk: $($_.DiskName) (OS Disk)"
+    } else {
+        Write-Output "Snapshot: $($_.SnapshotName) for Disk: $($_.DiskName)"
+    }
+}
+
+# Step 5: Copy Non-OS Disk Snapshots to Destination Storage Account
+# Destination config from Azure Automation variables (set by Terraform)
+$destinationSubscriptionId    = (Get-AutomationVariable -Name 'ForensicsSubscriptionId').Value
+$destinationResourceGroup     = (Get-AutomationVariable -Name 'ForensicsResourceGroup').Value
+$destinationStorageAccountName = (Get-AutomationVariable -Name 'ForensicsStorageAccountName').Value
+$destinationContainer         = (Get-AutomationVariable -Name 'ForensicsContainerName').Value
+$destinationkeyVaultName      = (Get-AutomationVariable -Name 'ForensicsKeyVaultName').Value
+
+if (-not $destinationSubscriptionId -or -not $destinationResourceGroup -or -not $destinationStorageAccountName -or -not $destinationContainer -or -not $destinationkeyVaultName) {
+    Write-Error "One or more Forensics* Automation variables are missing or empty. Ensure ForensicsSubscriptionId, ForensicsResourceGroup, ForensicsStorageAccountName, ForensicsContainerName, ForensicsKeyVaultName are set (e.g. via Terraform)."
+    return
+}
+
+Write-Output "Switching context to destination subscription: $destinationSubscriptionId..."
+Set-AzContext -SubscriptionId $destinationSubscriptionId
+
+Write-Output "Retrieving access keys for storage account '$destinationStorageAccountName'..."
+$destinationStorageKey = (Get-AzStorageAccountKey -ResourceGroupName $destinationResourceGroup -Name $destinationStorageAccountName)[0].Value
+Write-Output "Storage Account Key Retrieved: (Hidden for Security)"
+
+# Verify if Destination Container Exists - Create if Missing
+Write-Output "Checking if container '$destinationContainer' exists in storage account '$destinationStorageAccountName'..."
+$destinationStorageContext = New-AzStorageContext -StorageAccountName $destinationStorageAccountName `
+                                                  -StorageAccountKey $destinationStorageKey
+$container = Get-AzStorageContainer -Context $destinationStorageContext | Where-Object { $_.Name -eq $destinationContainer }
+
+if (-not $container) {
+    Write-Output "Container '$destinationContainer' does not exist. Creating container with NoPublicAccess..."
+    New-AzStorageContainer -Name $destinationContainer -Context $destinationStorageContext -Permission Off
+    Write-Output "Container '$destinationContainer' created successfully with NoPublicAccess."
+} else {
+    Write-Output "Container '$destinationContainer' already exists."
+}
+
+foreach ($snapshot in $snapshots) {
+    $snapshotName = $snapshot.SnapshotName
+    $diskName = $snapshot.DiskName
+    $destinationBlobName = "$snapshotName.vhd"  # Blob name in the destination account/container
+
+    # Skip copying the OS disk (controlled by IsOSDisk flag)
+    if ($snapshot.IsOSDisk) {
+        Write-Output "Skipping copy for OS disk snapshot '$snapshotName' (disk '$diskName')."
+        continue  # Skip this iteration
+    }
+
+    # Switch back to source subscription to generate SAS for the snapshot
+    Write-Output "Switching context back to source subscription: $sourceSubscriptionId..."
+    Set-AzContext -SubscriptionId $sourceSubscriptionId
+
+    Write-Output "Generating SAS token for snapshot '$snapshotName'..."
+    $snapshotSasUri = Grant-AzSnapshotAccess -ResourceGroupName $sourceResourceGroup `
+                                             -SnapshotName $snapshotName `
+                                             -DurationInSecond 86400 `
+                                             -Access Read
+    $sastoken = "`"$($snapshotSasUri.AccessSAS)`""
+
+    Write-Output "SAS Token Retrieved: (Hidden for Security)"
+
+    # Switch to destination subscription to start copying the snapshot
+    Write-Output "Switching context back to destination subscription: $destinationSubscriptionId..."
+    Set-AzContext -SubscriptionId $destinationSubscriptionId
+
+    Write-Output "Initiating copy for snapshot '$snapshotName' to destination blob '$destinationBlobName'..."
+    #Start-AzStorageBlobCopy -AbsoluteUri "$sastoken" ` Az command doesn't work, using CLI command below
+    #                       -Container $destinationContainer `
+    #                        -Context $destinationStorageContext `
+    #                        -Blob $destinationBlobName
+    az storage blob copy start `
+        --destination-blob "$destinationBlobName" `
+        --destination-container "$destinationContainer" `
+        --account-name "$destinationStorageAccountName" `
+        --account-key "$destinationStorageKey" `
+        --source-uri $sastoken
+
+    Write-Output "Snapshot '$snapshotName' successfully copied to destination storage account '$destinationStorageAccountName'."
+}
+Write-Output "All snapshots (excluding OS disk) have been successfully copied to storage account '$destinationStorageAccountName'."
+
+#Bolbs Hash calculation and creating a Secret in a Key Vault#############################
+# List all blobs in the container
+try {
+    Write-Output "Listing all blobs in the container '$destinationContainer'..."
+    $blobs = Get-AzStorageBlob -Container $destinationContainer -Context $destinationStorageContext
+    if ($blobs.Count -eq 0) {
+        Write-Output "No blobs found in the container. Exiting script."
+        exit 0
+    }
+    Write-Output "Successfully retrieved the list of blobs. Found $($blobs.Count) blobs."
+} catch {
+    Write-Error "Failed to list blobs in the container: $_"
+    exit 1
+}
+
+# Iterate over each blob to calculate hash and save it in Key Vault
+foreach ($blob in $blobs) {
+    try {
+        # Log the blob name
+        Write-Output "Processing blob: $($blob.Name)"
+
+        # Temporary file path for blob content
+        $tempFilePath = [System.IO.Path]::GetTempFileName()
+
+        # Download the blob content
+        Write-Output "Downloading blob '$($blob.Name)' to temporary file..."
+        Get-AzStorageBlobContent -Blob $blob.Name -Container $destinationContainer -Context $destinationStorageContext -Destination $tempFilePath -Force
+        Write-Output "Downloaded blob to: $tempFilePath"
+
+        # Calculate the file hash (SHA256) using a stream-based approach
+        Write-Output "Calculating SHA256 hash of the blob content using stream..."
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        $hashString = ""
+
+        # Open the file as a stream and compute the hash
+        try {
+            $stream = [System.IO.File]::OpenRead($tempFilePath)
+            $hashBytes = $sha256.ComputeHash($stream)
+            $hashString = -join ($hashBytes | ForEach-Object { $_.ToString("x2") })
+            Write-Output "Calculated Hash: $hashString"
+        } finally {
+            if ($null -ne $stream) {
+                $stream.Close()
+                $stream.Dispose()
+            }
+        }
+
+        # Create a compliant secret name for Key Vault
+        $secretName = $blob.Name.Replace(".", "-").Replace("_", "-")
+        # Truncate to 127 characters if needed
+        if ($secretName.Length -gt 127) {
+            $secretName = $secretName.Substring(0, 127)
+            Write-Warning "Secret name '$($blob.Name)' was truncated to fit the Key Vault naming rules."
+        }
+        Write-Output "Prepared secret name for Key Vault: $secretName"
+
+        # Convert the hash to a SecureString
+        $secureHashString = ConvertTo-SecureString $hashString -AsPlainText -Force
+
+        # Store the hash as a secret in Key Vault
+        Write-Output "Storing the hash in Key Vault..."
+        $secretResult = Set-AzKeyVaultSecret -VaultName $destinationkeyVaultName -Name $secretName -SecretValue $secureHashString
+        Write-Output "Successfully stored secret. Key Vault URI: $($secretResult.SecretUri)"
+
+        # Clean up the temporary file
+        Remove-Item -Path $tempFilePath -Force
+        Write-Output "Temporary file cleaned up."
+    } catch {
+        Write-Error "Failed to process blob '$($blob.Name)': $_"
+    }
+}
+
+Write-Output "Hash calculation and storage process completed for all blobs."

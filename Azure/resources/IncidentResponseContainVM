@@ -1,0 +1,166 @@
+#
+param (
+    [Parameter(Mandatory=$false)]
+    [object] $WebhookData
+)
+
+# Step 1: Validate Webhook Input
+if (-not $WebhookData) {
+    Write-Output "Runbook executed without webhook data. Exiting..."
+    return
+}
+
+Write-Output "Runbook triggered by webhook. Parsing input..."
+
+# Extract the RequestBody from WebhookData
+$RequestBodyJson = $WebhookData.RequestBody
+$requestBodyObject = $RequestBodyJson | ConvertFrom-Json
+
+# Extract VM details from the webhook payload
+$EventData = $requestBodyObject[0]
+$subject = $EventData.subject
+
+if (-not $subject) {
+    Write-Output "No subject/resource found in webhook payload. Exiting..."
+    return
+}
+
+# Parse the resource URI from `subject` to form Subscription ID, Resource Group Name, and VM Name
+Write-Output "Parsing resource details from subject: $subject..."
+$subjectComponents = $subject -split '/'
+$sourceSubscriptionId = $subjectComponents[2]         # Subscription ID
+$sourceResourceGroup = $subjectComponents[4]          # Resource Group Name
+$vmName = $subjectComponents[-1]                      # VM Name
+Write-Output "Extracted Details - Subscription: $sourceSubscriptionId, Resource Group: $sourceResourceGroup, VM Name: $vmName"
+
+# Step 2: Authenticate with Azure using Managed Identity
+Write-Output "Authenticating with Azure using Managed Identity..."
+Connect-AzAccount -Identity
+Write-Output "Authentication successful."
+Set-AzContext -SubscriptionId $sourceSubscriptionId
+
+# Step 3: Verify if the VM Contains the Required Tag `SecurityIncidentStatus: Contain`
+# Retrieve the VM object
+try {
+    $vm = Get-AzVM -ResourceGroupName $sourceResourceGroup -Name $vmName -ErrorAction Stop
+    Write-Output "Debug: VM NetworkProfile - $($vm.NetworkProfile | ConvertTo-Json -Depth 2)"
+} catch {
+    Write-Output "Failed to retrieve VM details for '$vmName'. Exception: $($_.Exception.Message)"
+    return
+}
+
+#Check the tags
+Write-Output "Retrieving VM '$vmName' NIC and NSG details..."
+
+if ($vm.Tags["SecurityIncidentStatus"] -ne "Contain") {
+    Write-Output "VM does not have the required tag pair SecurityIncidentStatus: Contain. Exiting runbook."
+    return
+}
+
+Write-Output "VM has the required tag pair SecurityIncidentStatus: Contain. Proceeding with further actions..."
+
+#Step 3.1 Retrieve the NIC for the VM and Validate NetworkProfile
+
+if (-not $vm.NetworkProfile -or -not $vm.NetworkProfile.NetworkInterfaces) {
+    Write-Output "VM '$vmName' does not have a valid NetworkProfile or attached NICs. Exiting..."
+    return
+}
+
+# Extract NIC name
+try {
+    $vmNicName = $vm.NetworkProfile.NetworkInterfaces.Id.Split('/')[-1]
+    Write-Output "Network interface (NIC) found for VM '$vmName': $vmNicName"
+} catch {
+    Write-Output "Failed to extract NIC name from VM. Exception: $($_.Exception.Message)"
+    return
+}
+
+# Retrieve NIC object
+try {
+    $nicObject = Get-AzNetworkInterface -Name $vmNicName -ResourceGroupName $sourceResourceGroup -ErrorAction Stop
+    Write-Output "NIC object retrieved successfully: $nicObject.Name"
+} catch {
+    Write-Output "Failed to retrieve NIC object for NIC '$vmNicName'."
+    return
+}
+
+# Step 4: Check Existing NSG Assignment
+try {
+    Write-Output "Checking NSG assignment for NIC '$vmNicName'..."
+    if ($nicObject.NetworkSecurityGroup) {
+        Write-Output "Unassigning existing NSG from NIC '$vmNicName'..."
+        $nicObject.NetworkSecurityGroup = $null
+        Set-AzNetworkInterface -NetworkInterface $nicObject
+        Write-Output "Existing NSG has been successfully unassigned."
+    } else {
+        Write-Output "No NSG is currently assigned to NIC '$vmNicName'. Proceeding to create a new Containment NSG."
+    }
+} catch {
+    Write-Output "Failed to unassign NSG from NIC '$vmNicName'. Exception: $($_.Exception.Message)"
+    return
+}
+
+# Step 5: Create NSG and Assign It
+try {
+    Write-Output "Creating a new containment NSG..."
+    $newNsgName = "$vmName-ContainmentNSG"
+    $newNsg = New-AzNetworkSecurityGroup `
+        -ResourceGroupName $sourceResourceGroup `
+        -Name $newNsgName `
+        -Location $nicObject.Location
+    Write-Output "New NSG '$newNsgName' created successfully."
+
+    Write-Output "Assigning new NSG '$newNsgName' to NIC '$vmNicName'..."
+    $nicObject.NetworkSecurityGroup = $newNsg
+    Set-AzNetworkInterface -NetworkInterface $nicObject
+    Write-Output "NSG '$newNsgName' successfully assigned to NIC '$vmNicName'."
+} catch {
+    Write-Output "Failed to create and assign NSG '$newNsgName'. Exception: $($_.Exception.Message)"
+    return
+}
+
+# Step 6: Retrieve NSG and Add Containment Rules
+try {
+    Write-Output "Retrieving NSG '$newNsgName' for updating rules..."
+    $newNsg = Get-AzNetworkSecurityGroup `
+        -Name $newNsgName `
+        -ResourceGroupName $sourceResourceGroup
+    Write-Output "NSG '$newNsgName' retrieved successfully for rule addition."
+
+    Write-Output "Adding containment rules to NSG '$newNsgName'..."
+    $blockInboundRule = New-AzNetworkSecurityRuleConfig `
+        -Name "BlockAllInboundTraffic" `
+        -Priority 100 `
+        -Direction "Inbound" `
+        -Access "Deny" `
+        -Protocol "*" `
+        -SourceAddressPrefix "*" `
+        -SourcePortRange "*" `
+        -DestinationAddressPrefix "*" `
+        -DestinationPortRange "*"
+
+    $blockOutboundRule = New-AzNetworkSecurityRuleConfig `
+        -Name "BlockAllOutboundTraffic" `
+        -Priority 101 `
+        -Direction "Outbound" `
+        -Access "Deny" `
+        -Protocol "*" `
+        -SourceAddressPrefix "*" `
+        -SourcePortRange "*" `
+        -DestinationAddressPrefix "*" `
+        -DestinationPortRange "*"
+
+    # Retrieve existing default rules and append containment rules
+    $currentRules = $newNsg.SecurityRules
+    $updatedRules = $currentRules + @($blockInboundRule, $blockOutboundRule)
+
+    # Update SecurityRules property with proper typing
+    $newNsg.SecurityRules = $updatedRules
+    Set-AzNetworkSecurityGroup -NetworkSecurityGroup $newNsg
+    Write-Output "Containment rules successfully applied to NSG '$newNsgName'."
+} catch {
+    Write-Output "Failed to add containment rules to NSG '$newNsgName'. Exception: $($_.Exception.Message)"
+    return
+}
+
+Write-Output "Runbook completed successfully!"
